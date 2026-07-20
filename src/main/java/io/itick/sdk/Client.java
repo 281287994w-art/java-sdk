@@ -1,18 +1,26 @@
 package io.itick.sdk;
 
 import com.google.gson.Gson;
+import com.google.gson.reflect.TypeToken;
+import io.itick.sdk.model.Depth;
+import io.itick.sdk.model.Kline;
+import io.itick.sdk.model.Quote;
+import io.itick.sdk.model.Tick;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
 import okhttp3.Response;
 import org.java_websocket.client.WebSocketClient;
 import org.java_websocket.handshake.ServerHandshake;
 
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.X509TrustManager;
+import java.lang.reflect.ParameterizedType;
+import java.lang.reflect.Type;
 import java.net.URI;
 import java.net.URISyntaxException;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.Timer;
-import java.util.TimerTask;
+import java.security.cert.X509Certificate;
+import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public class Client {
@@ -20,10 +28,10 @@ public class Client {
     private static final String WSS_URL = "wss://api.itick.org";
     
     // WebSocket constants
-    private static final int PING_INTERVAL = 30000; // 30 seconds
+    private static final int PING_INTERVAL = 3000; // 30 seconds
     private static final int RECONNECT_INTERVAL = 5000; // 5 seconds
     private static final int MAX_RECONNECT_ATTEMPTS = 10;
-    
+
     private final String token;
     private final OkHttpClient client;
     private final Gson gson;
@@ -35,12 +43,14 @@ public class Client {
     private Timer pingTimer;
     private MessageHandler messageHandler;
     private ErrorHandler errorHandler;
+    private Set<String> subscribedSymbols = new HashSet<>();
+    private Set<String> subscribedTypes = new HashSet<>();
 
     // Callback interfaces
     public interface MessageHandler {
         void onMessage(String message);
     }
-    
+
     public interface ErrorHandler {
         void onError(Exception error);
     }
@@ -73,40 +83,108 @@ public class Client {
         }
 
         String responseBody = response.body().string();
-        ApiResponse<?> apiResponse = gson.fromJson(responseBody, ApiResponse.class);
+        // 构建 ApiResponse<T> 的泛型类型
+        ParameterizedType apiResponseType = new ParameterizedType() {
+            @Override
+            public Type[] getActualTypeArguments() {
+                return new Type[]{responseType};
+            }
+
+            @Override
+            public Type getRawType() {
+                return ApiResponse.class;
+            }
+
+            @Override
+            public Type getOwnerType() {
+                return null;
+            }
+        };
+        ApiResponse<T> apiResponse = gson.fromJson(responseBody, apiResponseType);
         if (apiResponse.getCode() != 0) {
             throw new Exception("API error: " + apiResponse.getMsg());
         }
 
-        String dataJson = gson.toJson(apiResponse.getData());
-        return gson.fromJson(dataJson, responseType);
+        return apiResponse.getData();
+    }
+
+    private <T> T get(String path, Map<String, String> params, TypeToken<T> responseType) throws Exception {
+        StringBuilder urlBuilder = new StringBuilder(BASE_URL + path);
+        if (params != null && !params.isEmpty()) {
+            urlBuilder.append("?");
+            for (Map.Entry<String, String> entry : params.entrySet()) {
+                urlBuilder.append(entry.getKey()).append("=").append(entry.getValue()).append("&");
+            }
+            urlBuilder.deleteCharAt(urlBuilder.length() - 1);
+        }
+
+        Request request = new Request.Builder()
+                .url(urlBuilder.toString())
+                .addHeader("accept", "application/json")
+                .addHeader("token", token)
+                .build();
+
+        Response response = client.newCall(request).execute();
+        if (!response.isSuccessful()) {
+            throw new Exception("API error: " + response.message());
+        }
+
+        String responseBody = response.body().string();
+        // 构建 ApiResponse<T> 的泛型类型
+        T apiResponse = gson.fromJson(responseBody, responseType);
+
+        return apiResponse;
     }
 
     // WebSocket methods with enhanced functionality
-    
+
     public void setMessageHandler(MessageHandler handler) {
         this.messageHandler = handler;
     }
-    
+
     public void setErrorHandler(ErrorHandler handler) {
         this.errorHandler = handler;
     }
-    
+
     public void connectWebSocket(String path) throws URISyntaxException {
-        this.wsPath = path+"?token="+this.token;
+        this.wsPath = path + "?token=" + this.token;
         this.isRunning.set(true);
         connectWebSocketInternal();
     }
-    
+
     private void connectWebSocketInternal() {
         try {
             URI uri = new URI(WSS_URL + wsPath);
-            this.wsClient = new WebSocketClient(uri) {
+            Map<String, String> headers = new HashMap<>();
+            SSLContext sc = SSLContext.getInstance("SSL");
+            sc.init(null, new TrustManager[]{new X509TrustManager() {
+                public X509Certificate[] getAcceptedIssuers() {
+                    return null;
+                }
+
+                public void checkClientTrusted(X509Certificate[] certs, String authType) {}
+
+                public void checkServerTrusted(X509Certificate[] certs, String authType) {}
+            }}, new java.security.SecureRandom());
+
+            this.wsClient = new WebSocketClient(uri, headers) {
                 @Override
                 public void onOpen(ServerHandshake handshakedata) {
+                    System.out.println("Connected to WebSocket server" + WSS_URL);
                     isConnected.set(true);
                     reconnectAttempts = 0;
                     startPingTimer();
+                    //重新开启订阅
+                    if (!subscribedSymbols.isEmpty() && !subscribedTypes.isEmpty()) {
+                        new Timer().schedule(new TimerTask() {
+                            @Override
+                            public void run() {
+                                if (isConnected.get()) {
+                                    subscribedSymbol(subscribedSymbols, subscribedTypes);
+                                }
+                            }
+                        }, 1000); // 延迟 1 秒后订阅
+                    }
                 }
 
                 @Override
@@ -119,6 +197,11 @@ public class Client {
                 @Override
                 public void onClose(int code, String reason, boolean remote) {
                     isConnected.set(false);
+                    System.err.println("WebSocket closed - Code: " + code +
+                            ", Reason: " + reason +
+                            ", Remote: " + remote +
+                            ", Time:" + System.currentTimeMillis());
+
                     stopPingTimer();
                     if (isRunning.get()) {
                         scheduleReconnect();
@@ -137,14 +220,16 @@ public class Client {
                     }
                 }
             };
+            this.wsClient.setConnectionLostTimeout(0);
+            this.wsClient.setSocketFactory(sc.getSocketFactory());
             this.wsClient.connect();
-        } catch (URISyntaxException e) {
+        } catch (Exception e) {
             if (errorHandler != null) {
                 errorHandler.onError(e);
             }
         }
     }
-    
+
     private void startPingTimer() {
         stopPingTimer();
         pingTimer = new Timer();
@@ -152,19 +237,22 @@ public class Client {
             @Override
             public void run() {
                 if (wsClient != null && isConnected.get()) {
-                    wsClient.send("ping");
+                    Map<String, Object> pingData = new HashMap<>();
+                    pingData.put("ac", "ping");
+                    pingData.put("params", System.currentTimeMillis());
+                    wsClient.send(gson.toJson(pingData));
                 }
             }
         }, PING_INTERVAL, PING_INTERVAL);
     }
-    
+
     private void stopPingTimer() {
         if (pingTimer != null) {
             pingTimer.cancel();
             pingTimer = null;
         }
     }
-    
+
     private void scheduleReconnect() {
         if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
             if (errorHandler != null) {
@@ -172,7 +260,7 @@ public class Client {
             }
             return;
         }
-        
+
         reconnectAttempts++;
         new Thread(() -> {
             try {
@@ -184,6 +272,19 @@ public class Client {
                 Thread.currentThread().interrupt();
             }
         }).start();
+    }
+
+    public void subscribedSymbol(Set<String> symbols, Set<String> types) {
+        subscribedTypes.addAll(types);
+        subscribedSymbols.addAll(symbols);
+        if (!subscribedSymbols.isEmpty()) {
+            Map<String, String> params = new HashMap<>();
+            params.put("params", String.join(",", subscribedSymbols));
+            params.put("types", String.join(",", types));
+            params.put("ac", "subscribe");
+            // 开启订阅
+            sendWebSocketMessage(gson.toJson(params));
+        }
     }
 
     public void sendWebSocketMessage(String message) {
@@ -200,20 +301,19 @@ public class Client {
             wsClient.close();
         }
     }
-    
+
     public boolean isWebSocketConnected() {
         return isConnected.get();
     }
 
 
-
     // 基础模块
-    public Object getSymbolList() throws Exception {
-        return get("/symbol/list", null, Object.class);
+    public List getSymbolList() throws Exception {
+        return get("/symbol/list", null, List.class);
     }
 
-    public Object getSymbolHolidays() throws Exception {
-        return get("/symbol/holidays", null, Object.class);
+    public List getSymbolHolidays() throws Exception {
+        return get("/symbol/holidays", null, List.class);
     }
 
     // 股票模块
@@ -238,141 +338,209 @@ public class Client {
         return get("/stock/split", params, Object.class);
     }
 
-    public Object getStockTick(String region, String code) throws Exception {
+    public Tick getStockTick(String region, String code) throws Exception {
         Map<String, String> params = new HashMap<>();
         params.put("region", region);
         params.put("code", code);
-        return get("/stock/tick", params, Object.class);
+        return get("/stock/tick", params, Tick.class);
     }
 
-    public Object getStockQuote(String region, String code) throws Exception {
+    public Quote getStockQuote(String region, String code) throws Exception {
         Map<String, String> params = new HashMap<>();
         params.put("region", region);
         params.put("code", code);
-        return get("/stock/quote", params, Object.class);
+        return get("/stock/quote", params, Quote.class);
     }
 
-    public Object getStockDepth(String region, String code) throws Exception {
+    public Depth getStockDepth(String region, String code) throws Exception {
         Map<String, String> params = new HashMap<>();
         params.put("region", region);
         params.put("code", code);
-        return get("/stock/depth", params, Object.class);
+        return get("/stock/depth", params, Depth.class);
     }
 
-    public Object[] getStockKline(String region, String code, int period, int limit, Long end) throws Exception {
+    public Kline[] getStockKline(String region, String code, int kType, int limit, Long end) throws Exception {
         Map<String, String> params = new HashMap<>();
         params.put("region", region);
         params.put("code", code);
-        params.put("period", String.valueOf(period));
+        params.put("kType", String.valueOf(kType));
         params.put("limit", String.valueOf(limit));
         if (end != null) {
             params.put("end", String.valueOf(end));
         }
-        return get("/stock/kline", params, Object[].class);
+        return get("/stock/kline", params, Kline[].class);
     }
 
-    public Map<String, Object> getStockTicks(String region, String[] codes) throws Exception {
+    public Map<String, Tick> getStockTicks(String region, String[] codes) throws Exception {
         Map<String, String> params = new HashMap<>();
         params.put("region", region);
         params.put("codes", String.join(",", codes));
-        return get("/stock/ticks", params, HashMap.class);
+
+
+        TypeToken<ApiResponse<Map<String, Tick>>> typeToken = new TypeToken<ApiResponse<Map<String, Tick>>>() {
+        };
+        ApiResponse<Map<String, Tick>> apiResponse = get("/stock/ticks", params, typeToken);
+        if (apiResponse.getCode() != 0) {
+            throw new Exception("API error: " + apiResponse.getMsg());
+        }
+        return apiResponse.getData();
     }
 
-    public Map<String, Object> getStockQuotes(String region, String[] codes) throws Exception {
+    public Map<String, Quote> getStockQuotes(String region, String[] codes) throws Exception {
         Map<String, String> params = new HashMap<>();
         params.put("region", region);
         params.put("codes", String.join(",", codes));
-        return get("/stock/quotes", params, HashMap.class);
+
+
+        TypeToken<ApiResponse<Map<String, Quote>>> typeToken = new TypeToken<ApiResponse<Map<String, Quote>>>() {
+        };
+        ApiResponse<Map<String, Quote>> apiResponse = get("/stock/quotes", params, typeToken);
+        if (apiResponse.getCode() != 0) {
+            throw new Exception("API error: " + apiResponse.getMsg());
+        }
+        return apiResponse.getData();
     }
 
-    public Map<String, Object> getStockDepths(String region, String[] codes) throws Exception {
+    public Map<String, Depth> getStockDepths(String region, String[] codes) throws Exception {
         Map<String, String> params = new HashMap<>();
         params.put("region", region);
         params.put("codes", String.join(",", codes));
-        return get("/stock/depths", params, HashMap.class);
+
+
+        TypeToken<ApiResponse<Map<String, Depth>>> typeToken = new TypeToken<ApiResponse<Map<String, Depth>>>() {
+        };
+        ApiResponse<Map<String, Depth>> apiResponse = get("/stock/depths", params, typeToken);
+        if (apiResponse.getCode() != 0) {
+            throw new Exception("API error: " + apiResponse.getMsg());
+        }
+        return apiResponse.getData();
     }
 
-    public Map<String, Object[]> getStockKlines(String region, String[] codes, int period, int limit, Long end) throws Exception {
+    public Map<String, Kline[]> getStockKlines(String region, String[] codes, int kType, int limit, Long end) throws Exception {
         Map<String, String> params = new HashMap<>();
         params.put("region", region);
         params.put("codes", String.join(",", codes));
-        params.put("period", String.valueOf(period));
+        params.put("kType", String.valueOf(kType));
         params.put("limit", String.valueOf(limit));
         if (end != null) {
             params.put("end", String.valueOf(end));
         }
-        return get("/stock/klines", params, HashMap.class);
+        TypeToken<ApiResponse<Map<String, Kline[]>>> typeToken = new TypeToken<ApiResponse<Map<String, Kline[]>>>() {
+        };
+        ApiResponse<Map<String, Kline[]>> apiResponse = get("/stock/klines", params, typeToken);
+        if (apiResponse.getCode() != 0) {
+            throw new Exception("API error: " + apiResponse.getMsg());
+        }
+        return apiResponse.getData();
     }
 
     public void connectStockWebSocket() throws URISyntaxException {
         connectWebSocket("/stock");
     }
 
+    public void subscribeStockWebSocket() throws URISyntaxException {
+        connectWebSocket("/stock");
+    }
+
+
     // 指数模块
-    public Object getIndicesTick(String region, String code) throws Exception {
+    public Tick getIndicesTick(String region, String code) throws Exception {
         Map<String, String> params = new HashMap<>();
         params.put("region", region);
         params.put("code", code);
-        return get("/indices/tick", params, Object.class);
+        return get("/indices/tick", params, Tick.class);
     }
 
-    public Object getIndicesQuote(String region, String code) throws Exception {
+    public Quote getIndicesQuote(String region, String code) throws Exception {
         Map<String, String> params = new HashMap<>();
         params.put("region", region);
         params.put("code", code);
-        return get("/indices/quote", params, Object.class);
+        return get("/indices/quote", params, Quote.class);
     }
 
-    public Object getIndicesDepth(String region, String code) throws Exception {
+    public Depth getIndicesDepth(String region, String code) throws Exception {
         Map<String, String> params = new HashMap<>();
         params.put("region", region);
         params.put("code", code);
-        return get("/indices/depth", params, Object.class);
+        return get("/indices/depth", params, Depth.class);
     }
 
-    public Object[] getIndicesKline(String region, String code, int period, int limit, Long end) throws Exception {
+    public Kline[] getIndicesKline(String region, String code, int kType, int limit, Long end) throws Exception {
         Map<String, String> params = new HashMap<>();
         params.put("region", region);
         params.put("code", code);
-        params.put("period", String.valueOf(period));
+        params.put("kType", String.valueOf(kType));
         params.put("limit", String.valueOf(limit));
         if (end != null) {
             params.put("end", String.valueOf(end));
         }
-        return get("/indices/kline", params, Object[].class);
+
+        return get("/indices/kline", params, Kline[].class);
     }
 
-    public Map<String, Object> getIndicesTicks(String region, String[] codes) throws Exception {
+    public Map<String, Tick> getIndicesTicks(String region, String[] codes) throws Exception {
         Map<String, String> params = new HashMap<>();
         params.put("region", region);
         params.put("codes", String.join(",", codes));
-        return get("/indices/ticks", params, HashMap.class);
+
+
+        TypeToken<ApiResponse<Map<String, Tick>>> typeToken = new TypeToken<ApiResponse<Map<String, Tick>>>() {
+        };
+        ApiResponse<Map<String, Tick>> apiResponse = get("/indices/ticks", params, typeToken);
+        if (apiResponse.getCode() != 0) {
+            throw new Exception("API error: " + apiResponse.getMsg());
+        }
+        return apiResponse.getData();
     }
 
-    public Map<String, Object> getIndicesQuotes(String region, String[] codes) throws Exception {
+    public Map<String, Quote> getIndicesQuotes(String region, String[] codes) throws Exception {
         Map<String, String> params = new HashMap<>();
         params.put("region", region);
         params.put("codes", String.join(",", codes));
-        return get("/indices/quotes", params, HashMap.class);
+
+
+        TypeToken<ApiResponse<Map<String, Quote>>> typeToken = new TypeToken<ApiResponse<Map<String, Quote>>>() {
+        };
+        ApiResponse<Map<String, Quote>> apiResponse = get("/indices/quotes", params, typeToken);
+        if (apiResponse.getCode() != 0) {
+            throw new Exception("API error: " + apiResponse.getMsg());
+        }
+        return apiResponse.getData();
     }
 
-    public Map<String, Object> getIndicesDepths(String region, String[] codes) throws Exception {
+    public Map<String, Depth> getIndicesDepths(String region, String[] codes) throws Exception {
         Map<String, String> params = new HashMap<>();
         params.put("region", region);
         params.put("codes", String.join(",", codes));
-        return get("/indices/depths", params, HashMap.class);
+
+
+        TypeToken<ApiResponse<Map<String, Depth>>> typeToken = new TypeToken<ApiResponse<Map<String, Depth>>>() {
+        };
+        ApiResponse<Map<String, Depth>> apiResponse = get("/indices/depths", params, typeToken);
+        if (apiResponse.getCode() != 0) {
+            throw new Exception("API error: " + apiResponse.getMsg());
+        }
+        return apiResponse.getData();
     }
 
-    public Map<String, Object[]> getIndicesKlines(String region, String[] codes, int period, int limit, Long end) throws Exception {
+    public Map<String, Kline[]> getIndicesKlines(String region, String[] codes, int kType, int limit, Long end) throws Exception {
         Map<String, String> params = new HashMap<>();
         params.put("region", region);
         params.put("codes", String.join(",", codes));
-        params.put("period", String.valueOf(period));
+        params.put("kType", String.valueOf(kType));
         params.put("limit", String.valueOf(limit));
         if (end != null) {
             params.put("end", String.valueOf(end));
         }
-        return get("/indices/klines", params, HashMap.class);
+
+
+        TypeToken<ApiResponse<Map<String, Kline[]>>> typeToken = new TypeToken<ApiResponse<Map<String, Kline[]>>>() {
+        };
+        ApiResponse<Map<String, Kline[]>> apiResponse = get("/indices/klines", params, typeToken);
+        if (apiResponse.getCode() != 0) {
+            throw new Exception("API error: " + apiResponse.getMsg());
+        }
+        return apiResponse.getData();
     }
 
     public void connectIndicesWebSocket() throws URISyntaxException {
@@ -380,70 +548,98 @@ public class Client {
     }
 
     // 期货模块
-    public Object getFutureTick(String region, String code) throws Exception {
+    public Tick getFutureTick(String region, String code) throws Exception {
         Map<String, String> params = new HashMap<>();
         params.put("region", region);
         params.put("code", code);
-        return get("/future/tick", params, Object.class);
+        return get("/future/tick", params, Tick.class);
     }
 
-    public Object getFutureQuote(String region, String code) throws Exception {
+    public Quote getFutureQuote(String region, String code) throws Exception {
         Map<String, String> params = new HashMap<>();
         params.put("region", region);
         params.put("code", code);
-        return get("/future/quote", params, Object.class);
+        return get("/future/quote", params, Quote.class);
     }
 
-    public Object getFutureDepth(String region, String code) throws Exception {
+    public Depth getFutureDepth(String region, String code) throws Exception {
         Map<String, String> params = new HashMap<>();
         params.put("region", region);
         params.put("code", code);
-        return get("/future/depth", params, Object.class);
+        return get("/future/depth", params, Depth.class);
     }
 
-    public Object[] getFutureKline(String region, String code, int period, int limit, Long end) throws Exception {
+    public Kline[] getFutureKline(String region, String code, int kType, int limit, Long end) throws Exception {
         Map<String, String> params = new HashMap<>();
         params.put("region", region);
         params.put("code", code);
-        params.put("period", String.valueOf(period));
+        params.put("kType", String.valueOf(kType));
         params.put("limit", String.valueOf(limit));
         if (end != null) {
             params.put("end", String.valueOf(end));
         }
-        return get("/future/kline", params, Object[].class);
+        return get("/future/kline", params, Kline[].class);
     }
 
-    public Map<String, Object> getFutureTicks(String region, String[] codes) throws Exception {
+    public Map<String, Tick> getFutureTicks(String region, String[] codes) throws Exception {
         Map<String, String> params = new HashMap<>();
         params.put("region", region);
         params.put("codes", String.join(",", codes));
-        return get("/future/ticks", params, HashMap.class);
+        TypeToken<ApiResponse<Map<String, Tick>>> typeToken = new TypeToken<ApiResponse<Map<String, Tick>>>() {
+        };
+        ApiResponse<Map<String, Tick>> apiResponse = get("/future/ticks", params, typeToken);
+        if (apiResponse.getCode() != 0) {
+            throw new Exception("API error: " + apiResponse.getMsg());
+        }
+        return apiResponse.getData();
     }
 
-    public Map<String, Object> getFutureQuotes(String region, String[] codes) throws Exception {
+    public Map<String, Quote> getFutureQuotes(String region, String[] codes) throws Exception {
         Map<String, String> params = new HashMap<>();
         params.put("region", region);
         params.put("codes", String.join(",", codes));
-        return get("/future/quotes", params, HashMap.class);
+
+        TypeToken<ApiResponse<Map<String, Quote>>> typeToken = new TypeToken<ApiResponse<Map<String, Quote>>>() {
+        };
+        ApiResponse<Map<String, Quote>> apiResponse = get("/future/quotes", params, typeToken);
+        if (apiResponse.getCode() != 0) {
+            throw new Exception("API error: " + apiResponse.getMsg());
+        }
+        return apiResponse.getData();
     }
 
-    public Map<String, Object> getFutureDepths(String region, String[] codes) throws Exception {
+    public Map<String, Depth> getFutureDepths(String region, String[] codes) throws Exception {
         Map<String, String> params = new HashMap<>();
         params.put("region", region);
         params.put("codes", String.join(",", codes));
-        return get("/future/depths", params, HashMap.class);
+
+        TypeToken<ApiResponse<Map<String, Depth>>> typeToken = new TypeToken<ApiResponse<Map<String, Depth>>>() {
+        };
+        ApiResponse<Map<String, Depth>> apiResponse = get("/future/depths", params, typeToken);
+        if (apiResponse.getCode() != 0) {
+            throw new Exception("API error: " + apiResponse.getMsg());
+        }
+        return apiResponse.getData();
     }
 
-    public Map<String, Object[]> getFutureKlines(String region, String[] codes, int period, int limit, Long end) throws Exception {
+    public Map<String, Kline[]> getFutureKlines(String region, String[] codes, int kType, int limit, Long end) throws Exception {
         Map<String, String> params = new HashMap<>();
         params.put("region", region);
         params.put("codes", String.join(",", codes));
-        params.put("period", String.valueOf(period));
+        params.put("kType", String.valueOf(kType));
         params.put("limit", String.valueOf(limit));
         if (end != null) {
             params.put("end", String.valueOf(end));
         }
-        return get("/future/klines", params, HashMap.class);
+
+
+        TypeToken<ApiResponse<Map<String, Kline[]>>> typeToken = new TypeToken<ApiResponse<Map<String, Kline[]>>>() {
+        };
+        ApiResponse<Map<String, Kline[]>> apiResponse = get("/future/klines", params, typeToken);
+        if (apiResponse.getCode() != 0) {
+            throw new Exception("API error: " + apiResponse.getMsg());
+        }
+        return apiResponse.getData();
     }
 
     public void connectFutureWebSocket() throws URISyntaxException {
@@ -451,70 +647,98 @@ public class Client {
     }
 
     // 基金模块
-    public Object getFundTick(String region, String code) throws Exception {
+    public Tick getFundTick(String region, String code) throws Exception {
         Map<String, String> params = new HashMap<>();
         params.put("region", region);
         params.put("code", code);
-        return get("/fund/tick", params, Object.class);
+        return get("/fund/tick", params, Tick.class);
     }
 
-    public Object getFundQuote(String region, String code) throws Exception {
+    public Quote getFundQuote(String region, String code) throws Exception {
         Map<String, String> params = new HashMap<>();
         params.put("region", region);
         params.put("code", code);
-        return get("/fund/quote", params, Object.class);
+        return get("/fund/quote", params, Quote.class);
     }
 
-    public Object getFundDepth(String region, String code) throws Exception {
+    public Depth getFundDepth(String region, String code) throws Exception {
         Map<String, String> params = new HashMap<>();
         params.put("region", region);
         params.put("code", code);
-        return get("/fund/depth", params, Object.class);
+        return get("/fund/depth", params, Depth.class);
     }
 
-    public Object[] getFundKline(String region, String code, int period, int limit, Long end) throws Exception {
+    public Kline[] getFundKline(String region, String code, int kType, int limit, Long end) throws Exception {
         Map<String, String> params = new HashMap<>();
         params.put("region", region);
         params.put("code", code);
-        params.put("period", String.valueOf(period));
+        params.put("kType", String.valueOf(kType));
         params.put("limit", String.valueOf(limit));
         if (end != null) {
             params.put("end", String.valueOf(end));
         }
-        return get("/fund/kline", params, Object[].class);
+        return get("/fund/kline", params, Kline[].class);
     }
 
-    public Map<String, Object> getFundTicks(String region, String[] codes) throws Exception {
+    public Map<String, Tick> getFundTicks(String region, String[] codes) throws Exception {
         Map<String, String> params = new HashMap<>();
         params.put("region", region);
         params.put("codes", String.join(",", codes));
-        return get("/fund/ticks", params, HashMap.class);
+
+        TypeToken<ApiResponse<Map<String, Tick>>> typeToken = new TypeToken<ApiResponse<Map<String, Tick>>>() {
+        };
+        ApiResponse<Map<String, Tick>> apiResponse = get("/fund/ticks", params, typeToken);
+        if (apiResponse.getCode() != 0) {
+            throw new Exception("API error: " + apiResponse.getMsg());
+        }
+        return apiResponse.getData();
     }
 
-    public Map<String, Object> getFundQuotes(String region, String[] codes) throws Exception {
+    public Map<String, Quote> getFundQuotes(String region, String[] codes) throws Exception {
         Map<String, String> params = new HashMap<>();
         params.put("region", region);
         params.put("codes", String.join(",", codes));
-        return get("/fund/quotes", params, HashMap.class);
+
+        TypeToken<ApiResponse<Map<String, Quote>>> typeToken = new TypeToken<ApiResponse<Map<String, Quote>>>() {
+        };
+        ApiResponse<Map<String, Quote>> apiResponse = get("/fund/quotes", params, typeToken);
+        if (apiResponse.getCode() != 0) {
+            throw new Exception("API error: " + apiResponse.getMsg());
+        }
+        return apiResponse.getData();
     }
 
-    public Map<String, Object> getFundDepths(String region, String[] codes) throws Exception {
+    public Map<String, Depth> getFundDepths(String region, String[] codes) throws Exception {
         Map<String, String> params = new HashMap<>();
         params.put("region", region);
         params.put("codes", String.join(",", codes));
-        return get("/fund/depths", params, HashMap.class);
+
+        TypeToken<ApiResponse<Map<String, Depth>>> typeToken = new TypeToken<ApiResponse<Map<String, Depth>>>() {
+        };
+        ApiResponse<Map<String, Depth>> apiResponse = get("/fund/depths", params, typeToken);
+        if (apiResponse.getCode() != 0) {
+            throw new Exception("API error: " + apiResponse.getMsg());
+        }
+        return apiResponse.getData();
     }
 
-    public Map<String, Object[]> getFundKlines(String region, String[] codes, int period, int limit, Long end) throws Exception {
+    public Map<String, Kline[]> getFundKlines(String region, String[] codes, int kType, int limit, Long end) throws Exception {
         Map<String, String> params = new HashMap<>();
         params.put("region", region);
         params.put("codes", String.join(",", codes));
-        params.put("period", String.valueOf(period));
+        params.put("kType", String.valueOf(kType));
         params.put("limit", String.valueOf(limit));
         if (end != null) {
             params.put("end", String.valueOf(end));
         }
-        return get("/fund/klines", params, HashMap.class);
+
+        TypeToken<ApiResponse<Map<String, Kline[]>>> typeToken = new TypeToken<ApiResponse<Map<String, Kline[]>>>() {
+        };
+        ApiResponse<Map<String, Kline[]>> apiResponse = get("/fund/klines", params, typeToken);
+        if (apiResponse.getCode() != 0) {
+            throw new Exception("API error: " + apiResponse.getMsg());
+        }
+        return apiResponse.getData();
     }
 
     public void connectFundWebSocket() throws URISyntaxException {
@@ -522,70 +746,99 @@ public class Client {
     }
 
     // 外汇模块
-    public Object getForexTick(String region, String code) throws Exception {
+    public Tick getForexTick(String region, String code) throws Exception {
         Map<String, String> params = new HashMap<>();
         params.put("region", region);
         params.put("code", code);
-        return get("/forex/tick", params, Object.class);
+        return get("/forex/tick", params, Tick.class);
     }
 
-    public Object getForexQuote(String region, String code) throws Exception {
+    public Quote getForexQuote(String region, String code) throws Exception {
         Map<String, String> params = new HashMap<>();
         params.put("region", region);
         params.put("code", code);
-        return get("/forex/quote", params, Object.class);
+        return get("/forex/quote", params, Quote.class);
     }
 
-    public Object getForexDepth(String region, String code) throws Exception {
+    public Depth getForexDepth(String region, String code) throws Exception {
         Map<String, String> params = new HashMap<>();
         params.put("region", region);
         params.put("code", code);
-        return get("/forex/depth", params, Object.class);
+        return get("/forex/depth", params, Depth.class);
     }
 
-    public Object[] getForexKline(String region, String code, int period, int limit, Long end) throws Exception {
+    public Kline[] getForexKline(String region, String code, int kType, int limit, Long end) throws Exception {
         Map<String, String> params = new HashMap<>();
         params.put("region", region);
         params.put("code", code);
-        params.put("period", String.valueOf(period));
+        params.put("kType", String.valueOf(kType));
         params.put("limit", String.valueOf(limit));
         if (end != null) {
             params.put("end", String.valueOf(end));
         }
-        return get("/forex/kline", params, Object[].class);
+        return get("/forex/kline", params, Kline[].class);
     }
 
-    public Map<String, Object> getForexTicks(String region, String[] codes) throws Exception {
+    public Map<String, Tick> getForexTicks(String region, String[] codes) throws Exception {
         Map<String, String> params = new HashMap<>();
         params.put("region", region);
         params.put("codes", String.join(",", codes));
-        return get("/forex/ticks", params, HashMap.class);
+
+        TypeToken<ApiResponse<Map<String, Tick>>> typeToken = new TypeToken<ApiResponse<Map<String, Tick>>>() {
+        };
+        ApiResponse<Map<String, Tick>> apiResponse = get("/forex/ticks", params, typeToken);
+        if (apiResponse.getCode() != 0) {
+            throw new Exception("API error: " + apiResponse.getMsg());
+        }
+        return apiResponse.getData();
     }
 
-    public Map<String, Object> getForexQuotes(String region, String[] codes) throws Exception {
+    public Map<String, Quote> getForexQuotes(String region, String[] codes) throws Exception {
         Map<String, String> params = new HashMap<>();
         params.put("region", region);
         params.put("codes", String.join(",", codes));
-        return get("/forex/quotes", params, HashMap.class);
+
+        TypeToken<ApiResponse<Map<String, Quote>>> typeToken = new TypeToken<ApiResponse<Map<String, Quote>>>() {
+        };
+        ApiResponse<Map<String, Quote>> apiResponse = get("/forex/quotes", params, typeToken);
+        if (apiResponse.getCode() != 0) {
+            throw new Exception("API error: " + apiResponse.getMsg());
+        }
+        return apiResponse.getData();
     }
 
-    public Map<String, Object> getForexDepths(String region, String[] codes) throws Exception {
+    public Map<String, Depth> getForexDepths(String region, String[] codes) throws Exception {
         Map<String, String> params = new HashMap<>();
         params.put("region", region);
         params.put("codes", String.join(",", codes));
-        return get("/forex/depths", params, HashMap.class);
+
+        TypeToken<ApiResponse<Map<String, Depth>>> typeToken = new TypeToken<ApiResponse<Map<String, Depth>>>() {
+        };
+        ApiResponse<Map<String, Depth>> apiResponse = get("/forex/depths", params, typeToken);
+        if (apiResponse.getCode() != 0) {
+            throw new Exception("API error: " + apiResponse.getMsg());
+        }
+        return apiResponse.getData();
     }
 
-    public Map<String, Object[]> getForexKlines(String region, String[] codes, int period, int limit, Long end) throws Exception {
+    public Map<String, Kline[]> getForexKlines(String region, String[] codes, int kType, int limit, Long end) throws Exception {
         Map<String, String> params = new HashMap<>();
         params.put("region", region);
         params.put("codes", String.join(",", codes));
-        params.put("period", String.valueOf(period));
+        params.put("kType", String.valueOf(kType));
         params.put("limit", String.valueOf(limit));
         if (end != null) {
             params.put("end", String.valueOf(end));
         }
-        return get("/forex/klines", params, HashMap.class);
+
+
+        TypeToken<ApiResponse<Map<String, Kline[]>>> typeToken = new TypeToken<ApiResponse<Map<String, Kline[]>>>() {
+        };
+        ApiResponse<Map<String, Kline[]>> apiResponse = get("/forex/klines", params, typeToken);
+        if (apiResponse.getCode() != 0) {
+            throw new Exception("API error: " + apiResponse.getMsg());
+        }
+        return apiResponse.getData();
     }
 
     public void connectForexWebSocket() throws URISyntaxException {
@@ -593,70 +846,102 @@ public class Client {
     }
 
     // 加密货币模块
-    public Object getCryptoTick(String region, String code) throws Exception {
+    public Tick getCryptoTick(String region, String code) throws Exception {
         Map<String, String> params = new HashMap<>();
         params.put("region", region);
         params.put("code", code);
-        return get("/crypto/tick", params, Object.class);
+        return get("/crypto/tick", params, Tick.class);
     }
 
-    public Object getCryptoQuote(String region, String code) throws Exception {
+    public Quote getCryptoQuote(String region, String code) throws Exception {
         Map<String, String> params = new HashMap<>();
         params.put("region", region);
         params.put("code", code);
-        return get("/crypto/quote", params, Object.class);
+        return get("/crypto/quote", params, Quote.class);
     }
 
-    public Object getCryptoDepth(String region, String code) throws Exception {
+    public Depth getCryptoDepth(String region, String code) throws Exception {
         Map<String, String> params = new HashMap<>();
         params.put("region", region);
         params.put("code", code);
-        return get("/crypto/depth", params, Object.class);
+        return get("/crypto/depth", params, Depth.class);
     }
 
-    public Object[] getCryptoKline(String region, String code, int period, int limit, Long end) throws Exception {
+    public Kline[] getCryptoKline(String region, String code, int kType, int limit, Long end) throws Exception {
         Map<String, String> params = new HashMap<>();
         params.put("region", region);
         params.put("code", code);
-        params.put("period", String.valueOf(period));
+        params.put("kType", String.valueOf(kType));
         params.put("limit", String.valueOf(limit));
         if (end != null) {
             params.put("end", String.valueOf(end));
         }
-        return get("/crypto/kline", params, Object[].class);
+        return get("/crypto/kline", params, Kline[].class);
     }
 
-    public Map<String, Object> getCryptoTicks(String region, String[] codes) throws Exception {
+    public Map<String, Tick> getCryptoTicks(String region, String[] codes) throws Exception {
         Map<String, String> params = new HashMap<>();
         params.put("region", region);
         params.put("codes", String.join(",", codes));
-        return get("/crypto/ticks", params, HashMap.class);
+
+
+        TypeToken<ApiResponse<Map<String, Tick>>> typeToken = new TypeToken<ApiResponse<Map<String, Tick>>>() {
+        };
+        ApiResponse<Map<String, Tick>> apiResponse = get("/crypto/ticks", params, typeToken);
+        if (apiResponse.getCode() != 0) {
+            throw new Exception("API error: " + apiResponse.getMsg());
+        }
+        return apiResponse.getData();
     }
 
-    public Map<String, Object> getCryptoQuotes(String region, String[] codes) throws Exception {
+    public Map<String, Quote> getCryptoQuotes(String region, String[] codes) throws Exception {
         Map<String, String> params = new HashMap<>();
         params.put("region", region);
         params.put("codes", String.join(",", codes));
-        return get("/crypto/quotes", params, HashMap.class);
+
+
+        TypeToken<ApiResponse<Map<String, Quote>>> typeToken = new TypeToken<ApiResponse<Map<String, Quote>>>() {
+        };
+        ApiResponse<Map<String, Quote>> apiResponse = get("/crypto/quotes", params, typeToken);
+        if (apiResponse.getCode() != 0) {
+            throw new Exception("API error: " + apiResponse.getMsg());
+        }
+        return apiResponse.getData();
     }
 
-    public Map<String, Object> getCryptoDepths(String region, String[] codes) throws Exception {
+    public Map<String, Depth> getCryptoDepths(String region, String[] codes) throws Exception {
         Map<String, String> params = new HashMap<>();
         params.put("region", region);
         params.put("codes", String.join(",", codes));
-        return get("/crypto/depths", params, HashMap.class);
+
+
+        TypeToken<ApiResponse<Map<String, Depth>>> typeToken = new TypeToken<ApiResponse<Map<String, Depth>>>() {
+        };
+        ApiResponse<Map<String, Depth>> apiResponse = get("/crypto/depths", params, typeToken);
+        if (apiResponse.getCode() != 0) {
+            throw new Exception("API error: " + apiResponse.getMsg());
+        }
+        return apiResponse.getData();
     }
 
-    public Map<String, Object[]> getCryptoKlines(String region, String[] codes, int period, int limit, Long end) throws Exception {
+    public Map<String, Kline[]> getCryptoKlines(String region, String[] codes, int kType, int limit, Long end) throws Exception {
         Map<String, String> params = new HashMap<>();
         params.put("region", region);
         params.put("codes", String.join(",", codes));
-        params.put("period", String.valueOf(period));
+        params.put("kType", String.valueOf(kType));
         params.put("limit", String.valueOf(limit));
         if (end != null) {
             params.put("end", String.valueOf(end));
         }
-        return get("/crypto/klines", params, HashMap.class);
+
+
+        TypeToken<ApiResponse<Map<String, Kline[]>>> typeToken = new TypeToken<ApiResponse<Map<String, Kline[]>>>() {
+        };
+        ApiResponse<Map<String, Kline[]>> apiResponse = get("/crypto/klines", params, typeToken);
+        if (apiResponse.getCode() != 0) {
+            throw new Exception("API error: " + apiResponse.getMsg());
+        }
+        return apiResponse.getData();
     }
 
     public void connectCryptoWebSocket() throws URISyntaxException {
